@@ -112,7 +112,7 @@ callscribe gives each of these questions its own component. Each component has u
 | Metrics | WER with S/D/I, CER, cpWER, DER with collar |
 | Offline mode | Synthetic calls, the scripted ASR and the spectral diarizer. No key and no network |
 | Safety | `HF_TOKEN` is never printed. `callscribe config` shows only `set` or `not set` |
-| Tests | **49** unit tests pass (`pytest`). 2 tests skip without the optional backends |
+| Tests | **49** unit tests pass and **2** skip in CI (`pytest`). The 2 tests need the optional backends |
 
 ```mermaid
 flowchart LR
@@ -528,7 +528,7 @@ Credentials are only in a local `.env` file. Git ignores this file. Do not print
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **49 passed, 2 skipped** (faster-whisper and pyannote not installed). The same count is expected in CI | `pytest -q` |
+| Unit tests | **49 passed, 2 skipped** in CI (faster-whisper and pyannote are not installed) | `pytest -q` |
 | Synthetic test split, default parameters | Pooled WER 0.059, cpWER 1.082, DER 0.523 | `callscribe evaluate --manifest data/synthetic/manifest.json` |
 | Synthetic test split, tuned on dev | Pooled WER 0.059, cpWER 0.059, DER 0.000 | `callscribe evaluate ... --diarizer-params configs/diarizer_params.json` |
 | Synthetic test split, true speaker count | DER 0.000 | `callscribe evaluate ... --oracle-speakers` |
