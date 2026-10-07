@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "callscribe"
+version = "0.1.0"
+description = "Speaker-attributed transcripts for earnings calls (pyannote + Whisper)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.0"]
+diarize = ["pyannote.audio>=3.1", "torch>=2.1"]
+all = ["faster-whisper>=1.0", "pyannote.audio>=3.1", "torch>=2.1"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+callscribe = "callscribe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

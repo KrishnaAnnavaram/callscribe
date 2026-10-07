@@ -1,0 +1,32 @@
+# secrets and local settings
+.env
+.env.*
+!.env.example
+
+# data: only the data README is committed (root-anchored, so src/ is never hidden)
+/data/*
+!/data/README.md
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.db
+
+# run output and model caches
+/out/
+/reports/
+/models/
+/speech-datasets/
+manifest.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
