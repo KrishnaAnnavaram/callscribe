@@ -38,7 +38,7 @@
 
 callscribe makes a speaker-attributed transcript of a long call, for example a quarterly earnings call.
 A diarizer finds who talks when, an ASR backend finds the words, and an aligner gives each word a speaker.
-The main idea is one pipeline for all uses: the CLI, the evaluation and the tuning call the same `CallPipeline.run`.
+The main idea is one pipeline for all uses: the CLI and the evaluation call the same `CallPipeline.run`, and the tuning uses the same diarizer classes.
 Thus each reported WER, cpWER and DER describes the configured system.
 The full pipeline runs offline on synthetic calls, with no model download and no token.
 
@@ -70,6 +70,7 @@ This README is the **one location that explains all of callscribe**. It gives th
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one call](#42-the-life-cycle-of-one-call)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🎧 [Audio decoding and VAD](#5-audio-decoding-and-vad)
 6. ✂️ [The chunk planner](#6-the-chunk-planner)
 7. 🔵 [The ASR backends](#7-the-asr-backends)
@@ -145,6 +146,68 @@ flowchart LR
 | Synthetic calls | `src/callscribe/synthetic.py` | Tone-burst calls with exact references |
 | CLI | `src/callscribe/cli.py` | The `callscribe` command with 7 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses. All modules use the data types of `types.py`. The map does not show these arrows.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>callscribe command, 7 subcommands"]
+    end
+    CFG["config.py<br/>Settings, load_dotenv"]
+    subgraph RUN["The one pipeline"]
+        PIPE["pipeline.py<br/>build_pipeline, CallPipeline.run"]
+        ASR["asr.py<br/>ScriptedASR, FasterWhisperASR"]
+        DIA["diarize.py<br/>Spectral, Pyannote, Reference"]
+        ALN["align.py<br/>assign_speakers, utterances"]
+    end
+    subgraph SIGNAL["Audio and speech regions"]
+        AUD["audio.py<br/>load_audio, frame_rms"]
+        VAD["vad.py<br/>speech_mask, detect"]
+        CHK["chunking.py<br/>plan_chunks, ChunkedASR"]
+    end
+    subgraph SCORE["Scoring"]
+        EVA["evaluate.py<br/>evaluate, score, Report"]
+        TUN["tune.py<br/>tune, SPECTRAL_GRID"]
+        MET["metrics.py<br/>WER, CER, cpWER, DER"]
+        REF["references.py<br/>.nlp, RTTM, manifest"]
+    end
+    subgraph OUTS["Outputs and test data"]
+        EXP["export.py<br/>write_outputs"]
+        STA["stats.py<br/>speaker_stats, timeline"]
+        SYN["synthetic.py<br/>write_dataset"]
+    end
+
+    CLI --> CFG
+    CLI --> PIPE
+    CLI --> AUD
+    CLI --> EVA
+    CLI --> TUN
+    CLI --> DIA
+    CLI --> REF
+    CLI --> EXP
+    CLI --> STA
+    CLI --> SYN
+    PIPE --> CFG
+    PIPE --> ASR
+    PIPE --> DIA
+    PIPE --> ALN
+    EVA --> PIPE
+    EVA --> AUD
+    EVA --> MET
+    EVA --> REF
+    TUN --> DIA
+    TUN --> AUD
+    TUN --> MET
+    TUN --> REF
+    DIA --> VAD
+    CHK --> VAD
+    CHK -. "wraps a short-input ASR" .-> ASR
+    VAD --> AUD
+    EXP --> REF
+    SYN --> AUD
+    SYN --> REF
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -183,7 +246,21 @@ callscribe/
 ## 3. Design rules
 
 ### 3.1 One pipeline for each use
-`CallPipeline.run` is the only path from audio to a transcript. `callscribe transcribe`, `callscribe evaluate` and `callscribe tune` all use it. A test checks that the evaluated WER equals the WER of the pipeline output.
+`CallPipeline.run` is the only path from audio to a transcript. `callscribe transcribe` and `callscribe evaluate` use it. `callscribe tune` scores only the diarizer stage, with the same diarizer classes that `build_pipeline` makes. A test checks that the evaluated WER equals the WER of the pipeline output.
+
+```mermaid
+flowchart LR
+    TR["callscribe transcribe"] --> BP["build_pipeline(settings)"]
+    EV["callscribe evaluate<br/>evaluate()"] --> BP
+    BP --> RUN["CallPipeline.run"]
+    RUN --> T[/"Transcript"/]
+    T --> WO["write_outputs"]
+    T --> SC["score"]
+    TU["callscribe tune<br/>tune()"] --> F["spectral_from_params<br/>or PyannoteDiarizer"]
+    BP --> F
+    F --> D["diarizer.diarize"]
+    D --> DER[/"Pooled DER on the dev split"/]
+```
 
 ### 3.2 The right metric for each question
 WER measures the words, with order and repeats. cpWER measures the words and the speakers together. DER measures the turns. The code does not use set overlap or embedding cosine as a quality metric, because they can be high for a bad transcript.
@@ -210,13 +287,22 @@ The harness scores each call of a split. The pooled WER adds all errors and divi
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    AUD["Audio file"] --> DEC["load_audio: 16 kHz mono float32"]
-    DEC --> DIA{"CALLSCRIBE_DIARIZER"}
+flowchart TD
+    AUD[/"Audio file<br/>WAV, MP3, FLAC, M4A"/] --> DEC["load_audio: 16 kHz mono float32"]
+    SET[/"Settings: environment and .env"/] --> BP["build_pipeline"]
+    REFS[("Reference .nlp and .rttm files")] --> BP
+    TUNE["callscribe tune on the dev split"] --> HP{{"HUMAN<br/>check the best dev DER,<br/>set CALLSCRIBE_DIARIZER_PARAMS"}}
+    HP --> PAR[("Diarizer params JSON")]
+    PAR --> BP
+    DIA{"CALLSCRIBE_DIARIZER"}
+    ASR{"CALLSCRIBE_ASR_BACKEND"}
+    BP --> DIA
+    BP --> ASR
+    DEC --> DIA
+    DEC --> ASR
     DIA -- "spectral" --> SD["SpectralDiarizer (params JSON)"]
     DIA -- "pyannote" --> PD["PyannoteDiarizer 3.x (params JSON, HF_TOKEN)"]
     DIA -- "reference" --> RD["ReferenceDiarizer (RTTM)"]
-    DEC --> ASR{"CALLSCRIBE_ASR_BACKEND"}
     ASR -- "faster-whisper" --> FW["Word timestamps, Silero VAD"]
     ASR -- "scripted" --> SA["Reference words + seeded errors"]
     SD --> AL["assign_speakers"]
@@ -225,12 +311,45 @@ flowchart TB
     FW --> AL
     SA --> AL
     AL --> UT["utterances"]
-    UT --> EX["JSON, SRT, TXT, RTTM"]
+    UT --> EX[/"JSON, SRT, TXT, RTTM"/]
     UT --> SC["score: WER, CER, cpWER, DER"]
-    SC --> REP["report.json, report.md"]
+    REFS --> SC
+    SC --> REP[/"report.json, report.md"/]
+    REP --> HR{{"HUMAN<br/>read the pooled scores"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HP,HR human
 ```
 
 ### 4.2 The life cycle of one call
+
+```mermaid
+stateDiagram-v2
+    state "Pipeline built" as Built
+    state "Samples, 16 kHz mono" as Samples
+    state "Turns with speaker labels" as Turns
+    state "Words with times" as Words
+    state "Words with speakers" as Attributed
+    state "Transcript with utterances" as Transcript
+    state "Transcript files" as Written
+    state "FileResult scores" as Scored
+    [*] --> Built: build_pipeline(settings)
+    Built --> ValueError: scripted ASR without .nlp, or reference diarizer without RTTM
+    Built --> FileNotFoundError: audio file absent
+    Built --> AudioError: ffmpeg absent or failed
+    Built --> Samples: load_audio
+    Samples --> Turns: diarizer.diarize
+    Turns --> Words: asr.transcribe
+    Words --> Attributed: assign_speakers, else UNKNOWN
+    Attributed --> Transcript: utterances
+    Transcript --> Written: write_outputs, in transcribe
+    Transcript --> Scored: score, in evaluate
+    Written --> [*]
+    Scored --> [*]
+    ValueError --> [*]: CLI exit code 2
+    FileNotFoundError --> [*]: CLI exit code 2
+    AudioError --> [*]: CLI exit code 2
+```
 
 1. The CLI reads the settings from the environment and the optional `.env` file.
 2. `build_pipeline` makes the ASR backend and the diarizer that the settings name.
@@ -242,11 +361,73 @@ flowchart TB
 8. `write_outputs` writes the transcript files.
 9. In an evaluation, `score` compares the transcript with the `.nlp` and `.rttm` references.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as callscribe CLI
+    participant PIPE as pipeline.py
+    participant HF as Hugging Face hub
+    participant DIA as Diarizer
+    participant ASR as ASR backend
+    participant EVA as evaluate.py
+    participant FS as out/ folder
+
+    OP->>CLI: callscribe transcribe call.wav
+    CLI->>CLI: load_dotenv, Settings.from_env, validate
+    CLI->>CLI: read_nlp and read_rttm if the backends need them
+    CLI->>PIPE: build_pipeline(settings, ref_words, ref_turns)
+    PIPE->>HF: Pipeline.from_pretrained with HF_TOKEN, pyannote only
+    CLI->>CLI: load_audio, 16 kHz mono
+    CLI->>PIPE: CallPipeline.run(audio, sr, num_speakers)
+    PIPE->>DIA: diarize(x, sr, num_speakers)
+    DIA-->>PIPE: turns
+    PIPE->>ASR: transcribe(x, sr, offset 0)
+    ASR-->>PIPE: words with times
+    PIPE->>PIPE: assign_speakers, then utterances
+    PIPE-->>CLI: Transcript
+    CLI->>FS: write_outputs: json, srt, txt, rttm
+    CLI-->>OP: word, speaker and utterance counts
+    OP->>CLI: callscribe evaluate --manifest m.json --split test
+    CLI->>EVA: evaluate(items, settings, split)
+    loop each manifest item
+        EVA->>PIPE: build_pipeline, then CallPipeline.run
+        PIPE-->>EVA: Transcript
+        EVA->>EVA: score: WER, CER, cpWER, DER
+    end
+    EVA-->>CLI: Report with pooled numbers
+    CLI->>FS: write_report: report.json, report.md
+    CLI-->>OP: Markdown table
+```
+
 ---
 
 ## 5. Audio decoding and VAD
 
 **Purpose.** Give each later stage the same 16 kHz mono samples and the speech regions.
+
+```mermaid
+flowchart TD
+    IN[/"Audio path"/] --> EX{"File exists?"}
+    EX -- "no" --> E1[/"FileNotFoundError"/]
+    EX -- "yes" --> WAV{"Suffix .wav?"}
+    WAV -- "yes" --> RW["read_wav: 8, 16 or 32-bit PCM,<br/>average the channels"]
+    RW --> RS["resample: resample_poly to 16 kHz"]
+    WAV -- "no" --> FF{"ffmpeg on the PATH?"}
+    FF -- "no" --> E2[/"AudioError with an install message"/]
+    FF -- "yes" --> DF["decode_ffmpeg: s16le, mono,<br/>16 kHz through a pipe"]
+    DF -- "ffmpeg fails" --> E2
+    RS --> X["float32 samples in memory"]
+    DF --> X
+    X --> FR["frame_rms: 25 ms frames, 10 ms hop"]
+    FR --> DB["Level in dB,<br/>floor = 10th percentile"]
+    DB --> TH["Speech if the level is above floor + 18 dB<br/>and above loudest frame - 60 dB"]
+    TH --> CG["_close_gaps: gaps shorter than 0.25 s"]
+    CG --> DS["_drop_short: islands shorter than 0.10 s"]
+    DS --> OUT[/"Speech regions in seconds"/]
+```
 
 | Input | Output |
 |---|---|
@@ -257,7 +438,7 @@ flowchart TB
 1. If the file is WAV, read it with the standard `wave` module. Average the channels and resample with a polyphase filter.
 2. Else, start `ffmpeg` and read raw 16-bit samples from its standard output.
 3. Calculate the energy of each 25 ms frame with a 10 ms hop.
-4. Mark a frame as speech if its level is 18 dB above the 10th percentile of all frames.
+4. Mark a frame as speech if its level is more than 18 dB above the 10th percentile of all frames and not more than 60 dB below the loudest frame.
 5. Close gaps shorter than 0.25 s. Remove speech islands shorter than 0.10 s.
 
 **Rules**
@@ -271,6 +452,23 @@ flowchart TB
 
 **Purpose.** Let a short-input ASR model read a long call with no lost or repeated words.
 
+```mermaid
+flowchart TD
+    IN[/"Samples, speech regions from detect,<br/>max_len 30 s, overlap 1 s"/] --> G["Silence middles between<br/>speech regions"]
+    G --> L{"Rest of the call<br/>longer than max_len?"}
+    L -- "yes" --> O{"Silence middle from current + 10 s<br/>to current + max_len?"}
+    O -- "yes" --> C1["Cut at the latest one"]
+    O -- "no" --> C2["Cut at current + max_len"]
+    C1 -- "next chunk" --> L
+    C2 -- "next chunk" --> L
+    L -- "no" --> CH["Chunk: own region, and an audio window<br/>with overlap on each side"]
+    CH --> T["inner.transcribe of each window,<br/>shift word times to call time"]
+    T --> M{"merge_words: word midpoint<br/>in the own region?"}
+    M -- "yes" --> K["Keep the word"]
+    M -- "no" --> D["Drop the word"]
+    K --> OUT[/"Words sorted by time,<br/>each word once"/]
+```
+
 | Input | Output |
 |---|---|
 | Duration, speech regions, `max_len` (default 30 s), `overlap` (default 1 s) | A list of `Chunk` objects: own region and audio window |
@@ -278,7 +476,7 @@ flowchart TB
 **Procedure**
 
 1. Find the middle of each silence between two speech regions.
-2. From the current time, find the latest silence middle before `current + max_len`.
+2. Find the latest silence middle from `current + min(10 s, max_len / 2)` to `current + max_len`.
 3. If there is one, cut there. Else, cut at `current + max_len`.
 4. Repeat until the rest of the call is shorter than `max_len`.
 5. Give each chunk an audio window: its own region plus `overlap` seconds on each side.
@@ -294,6 +492,29 @@ flowchart TB
 
 ## 7. The ASR backends
 
+```mermaid
+flowchart TD
+    IN[/"Audio window x, sr, offset"/] --> B{"CALLSCRIBE_ASR_BACKEND"}
+    B -- "faster-whisper" --> FW["WhisperModel.transcribe: beam 5,<br/>word_timestamps, vad_filter,<br/>no condition on previous text"]
+    FW --> FWO["Each non-empty word with<br/>start, end, probability"]
+    B -- "scripted" --> R["Next reference word"]
+    R --> IW{"Word fully inside<br/>the window?"}
+    IW -- "no" --> SK["Skip the word"]
+    IW -- "yes" --> U["u = hash of seed and word index"]
+    U --> DEL{"u below del_rate 0.03?"}
+    DEL -- "yes" --> SK
+    DEL -- "no" --> SUB{"u below del_rate + sub_rate?"}
+    SUB -- "yes" --> S["Replace with a word<br/>of the call vocabulary"]
+    SUB -- "no" --> K["Keep the reference text"]
+    S --> EM["Emit the word, prob 0.9"]
+    K --> EM
+    EM --> INS{"Second hash<br/>below ins_rate 0.02?"}
+    INS -- "yes" --> F["Add a filler word, prob 0.3"]
+    INS -- "no" --> OUT[/"Words with times<br/>relative to x"/]
+    F --> OUT
+    FWO --> OUT
+```
+
 | Backend | Setting | What it does | Needs |
 |---|---|---|---|
 | `faster-whisper` | `CALLSCRIBE_ASR_BACKEND=faster-whisper` | Whisper (`large-v3` by default) with word timestamps, Silero VAD, beam 5, no conditioning on the previous text | Extra `asr`, a model download |
@@ -308,6 +529,29 @@ flowchart TB
 ---
 
 ## 8. The diarizers
+
+```mermaid
+flowchart TD
+    IN[/"Samples, sr, num_speakers"/] --> SM["speech_mask: VAD flag<br/>for each 10 ms frame"]
+    IN --> BE["band_energies: log energy in 32 bands,<br/>60 Hz to 4 kHz"]
+    SM --> WIN["1 s windows, 0.5 s step"]
+    BE --> WIN
+    WIN --> SF{"Speech fraction<br/>at least 0.3?"}
+    SF -- "no" --> SKIP["Skip the window"]
+    SF -- "yes" --> EMB["Mean of the speech frames,<br/>subtract the mean, divide by the norm"]
+    EMB --> ANY{"Any window?"}
+    ANY -- "no" --> NONE[/"No turns"/]
+    ANY -- "yes" --> LK["linkage: average,<br/>cosine distance"]
+    LK --> N{"num_speakers given?"}
+    N -- "yes" --> MC["fcluster: maxclust<br/>at num_speakers"]
+    N -- "no" --> TH["fcluster: distance<br/>at threshold"]
+    MC --> LAB["Each speech frame gets the label<br/>of the nearest window center"]
+    TH --> LAB
+    LAB --> TURN["Runs of frames become turns"]
+    TURN --> MT["merge_turns: min_duration_off,<br/>then min_duration_on"]
+    MT --> RL["relabel: SPEAKER_00, SPEAKER_01, ..."]
+    RL --> OUT[/"Turns"/]
+```
 
 | Diarizer | Setting | What it does |
 |---|---|---|
@@ -343,6 +587,24 @@ flowchart TB
 
 **Purpose.** Give each word one speaker label, then make readable utterances.
 
+```mermaid
+flowchart TD
+    IN[/"Words and turns"/] --> W["assign_speakers: next word"]
+    W --> OV{"Overlap with a turn?"}
+    OV -- "yes" --> BEST["Speaker with the largest<br/>summed overlap"]
+    OV -- "no" --> NR{"Nearest turn<br/>within 0.5 s?"}
+    NR -- "yes" --> NS["Speaker of the nearest turn"]
+    NR -- "no" --> UK["UNKNOWN"]
+    BEST --> AW["Word with a speaker"]
+    NS --> AW
+    UK --> AW
+    AW --> CH{"utterances: speaker change or<br/>pause longer than 1.0 s?"}
+    CH -- "yes" --> NEW["Close the utterance,<br/>start a new one"]
+    CH -- "no" --> ADD["Add the word to<br/>the current utterance"]
+    NEW --> OUT[/"Utterances: start, end,<br/>speaker, text"/]
+    ADD --> OUT
+```
+
 **Procedure**
 
 1. For each word, add the overlap time of the word with the turns of each speaker.
@@ -354,6 +616,30 @@ flowchart TB
 ---
 
 ## 10. The metrics
+
+```mermaid
+flowchart TD
+    subgraph WERG["WER and CER"]
+        T1[/"Reference and hypothesis text"/] --> NO["normalize"]
+        NO --> CELLS{"ref x hyp at most<br/>20,000,000 cells?"}
+        CELLS -- "yes" --> BT["Full DP table and backtrace:<br/>total, S, D, I"]
+        CELLS -- "no" --> TOT["Row DP: total edits only"]
+        NO --> CL{"Text longer than<br/>20,000 characters?"}
+        CL -- "yes" --> NAN["CER = NaN"]
+        CL -- "no" --> CER["Character edit distance"]
+    end
+    subgraph CPG["cpWER"]
+        W1[/"Words with speakers"/] --> ST["speaker_streams"]
+        ST --> CM["Cost matrix: edit distance<br/>of each stream pair"]
+        CM --> HU["linear_sum_assignment:<br/>best mapping"]
+    end
+    subgraph DERG["DER"]
+        TU[/"Reference and hypothesis turns"/] --> FR["10 ms activity frames"]
+        FR --> CO["Remove the collar frames,<br/>0.25 s on each side"]
+        CO --> MP["linear_sum_assignment<br/>on co-activity"]
+        MP --> ME["missed, false alarm, confusion"]
+    end
+```
 
 | Metric | Definition | Module rule |
 |---|---|---|
@@ -378,6 +664,28 @@ The edit distance uses one NumPy row operation for each reference word. Thus a o
 
 **Purpose.** Score the configured pipeline on a split of a manifest, and tune the diarizer on the dev split.
 
+```mermaid
+flowchart TD
+    M[/"manifest.json and --split"/] --> RM["read_manifest: items of the split"]
+    RM --> IT["Next item"]
+    IT --> BP["build_pipeline: .nlp for the scripted ASR,<br/>RTTM for the reference diarizer"]
+    BP --> LA["load_audio"]
+    LA --> OS{"--oracle-speakers?"}
+    OS -- "yes" --> NS["num_speakers = speakers in the .nlp file"]
+    OS -- "no" --> NN["num_speakers = None"]
+    NS --> RUN["CallPipeline.run"]
+    NN --> RUN
+    RUN --> SC["score: WER, S/D/I, CER, cpWER"]
+    SC --> RT{"Item has an RTTM file?"}
+    RT -- "yes" --> DER["der with collar"]
+    RT -- "no" --> FR["FileResult"]
+    DER --> FR
+    FR -- "more items" --> IT
+    FR --> POOL["Report.pooled: sum of errors<br/>divided by sum of reference"]
+    POOL --> OUT[/"report.json, report.md"/]
+    RM -- "no item" --> ERR[/"ValueError"/]
+```
+
 **Procedure of the evaluation**
 
 1. Read the manifest items of the split (`dev`, `test` or `all`).
@@ -388,6 +696,26 @@ The edit distance uses one NumPy row operation for each reference word. Thus a o
 6. Write `report.json` and `report.md`.
 
 **Procedure of the tuning**
+
+```mermaid
+flowchart TD
+    M[/"Dev items of the manifest"/] --> TS{"Any item in the test split?"}
+    TS -- "yes" --> E1[/"ValueError: never on the test split"/]
+    TS -- "no" --> RT["Keep the items with an RTTM file"]
+    RT --> EM{"Any item left?"}
+    EM -- "no" --> E2[/"ValueError"/]
+    EM -- "yes" --> LD["load_audio and read_rttm,<br/>once for each item"]
+    LD --> GR["Next parameter set of the grid:<br/>SPECTRAL_GRID or PYANNOTE_GRID"]
+    GR --> DZ["factory(params), then diarize<br/>each dev call"]
+    DZ --> PD["Pooled DER: sum of errors<br/>divided by sum of reference"]
+    PD -- "more sets" --> GR
+    PD --> BEST["Set with the lowest pooled DER"]
+    BEST --> SV[("Params JSON: params and meta")]
+    SV --> HUMAN{{"HUMAN<br/>set CALLSCRIBE_DIARIZER_PARAMS"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
 
 1. Read the dev items. They must have RTTM files.
 2. For each parameter set of the grid, diarize each dev call and add the DER errors.
@@ -409,6 +737,25 @@ The edit distance uses one NumPy row operation for each reference word. Thus a o
 ---
 
 ## 12. Exports and speaker statistics
+
+```mermaid
+flowchart LR
+    T[/"Transcript"/] --> WO["write_outputs, --formats"]
+    WO --> FC{"Unknown format?"}
+    FC -- "yes" --> ERR[/"ValueError"/]
+    FC -- "no" --> J["to_json: meta, utterances,<br/>words, turns"]
+    FC -- "no" --> S["to_srt: one block<br/>for each utterance"]
+    FC -- "no" --> X["to_txt: speaker, times, text"]
+    FC -- "no" --> R["to_rttm: one SPEAKER line<br/>for each turn"]
+    J --> F[/"out/stem.json, .srt, .txt, .rttm"/]
+    S --> F
+    X --> F
+    R --> F
+    F --> FD["callscribe stats:<br/>Transcript.from_dict"]
+    FD --> SS["speaker_stats: talk time, share,<br/>turns, words, wpm, longest turn"]
+    SS --> TL["timeline: 60 cells<br/>for each speaker"]
+    TL --> P[/"Table and text timeline<br/>on the console"/]
+```
 
 | Format | Content |
 |---|---|
@@ -464,6 +811,17 @@ cp .env.example .env            # optional
 ### 14.3 Run callscribe
 
 Offline (no download, no token):
+
+```mermaid
+flowchart LR
+    SY["callscribe synth<br/>WAV, .nlp, .rttm, manifest.json"] --> TU["callscribe tune<br/>dev calls: every fourth call"]
+    TU --> P[("configs/diarizer_params.json")]
+    P --> EV["callscribe evaluate<br/>test calls"]
+    P --> TR["callscribe transcribe<br/>one WAV file"]
+    EV --> R[/"out/eval: report.json, report.md"/]
+    TR --> O[/"out: synth001.json, .srt, .txt, .rttm"/]
+    O --> ST["callscribe stats"]
+```
 
 ```bash
 callscribe synth --out data/synthetic --calls 12
@@ -561,7 +919,7 @@ Read these problems before you use callscribe in production.
 
 ## 18. Key points
 
-1. **One pipeline for each use.** The CLI, the evaluation and the tuning call the same `CallPipeline.run`.
+1. **One pipeline for each use.** The CLI and the evaluation call the same `CallPipeline.run`. The tuning uses the same diarizer classes.
 2. **WER, cpWER and DER replace word overlap.** Each metric answers one question: words, words with speakers, turns.
 3. **No word is cut or counted twice.** Chunks cut in silences, overlap, and keep each word by its midpoint.
 4. **Parameters come from the dev split.** On the synthetic test split, tuning reduced DER from 0.523 to 0.000.
